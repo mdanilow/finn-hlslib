@@ -1,182 +1,192 @@
-/******************************************************************************
- *  Copyright (c) 2019, Xilinx, Inc.
- *  All rights reserved.
- *
- *  Redistribution and use in source and binary forms, with or without
- *  modification, are permitted provided that the following conditions are met:
- *
- *  1.  Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *
- *  2.  Redistributions in binary form must reproduce the above copyright
- *      notice, this list of conditions and the following disclaimer in the
- *      documentation and/or other materials provided with the distribution.
- *
- *  3.  Neither the name of the copyright holder nor the names of its
- *      contributors may be used to endorse or promote products derived from
- *      this software without specific prior written permission.
- *
- *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- *  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
- *  THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- *  PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
- *  CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- *  EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- *  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- *  OR BUSINESS INTERRUPTION). HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- *  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- *  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
- *  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- ******************************************************************************/
- 
-/******************************************************************************
- *
- *  Authors: Giulio Gambardella <giuliog@xilinx.com>
- *  		    erling on 5/10/21.
- *
- *
- *  Library of templated HLS functions for QNN deployment. 
- *  Targeting upsampling layers
- *
- ******************************************************************************/
-
 #ifndef UPSAMPLE_HPP
 #define UPSAMPLE_HPP
 
 #include <ap_int.h>
 #include <hls_stream.h>
+#include <functional>
+
+#include "util.hpp"
 
 
 /**
- * \brief Upsampling with the Nearest Neighbour algorithm. Works with square feature maps
+ * @brief  Two-dimensional nearest-neighbor upsampling.
+ * @description
+ *	This implementation leverages the Bresenham approximation approach,
+ *	originally devised for approximated line drawing on pixelated output
+ *	devices, for the selection of the desired closest input positions.
+ *	This selection process is performed independently along each feature map
+ *	dimension.
+ *	In each dimension, output coordinates [0, O) are mapped back to input
+ *	coordinates [0, I). With respect to Bresenham, the output assumes the role
+ *	of the x- and the input the role of the y-axis in drawing a line of a slope
+ *	smaller than 1. The mappings of the first and last pixels, i.e. (0, 0) and
+ *	(O-1, I-1) are used as anchors and are assumed to have no associated
+ *	approximation errors. For intermediate mappings (o, i), we seek the nearest
+ *	input index as:
+ *		i = round( (I-1)/(O-1) * o )
+ *	We choose to use rounding up for ties and substitute:
+ *		X := O-1
+ *		Y := I-1
+ *	to yield:
+ *		i = round( Y/X * o )
  *
- * \tparam 	OFMDim 		Size of the output feature map
- * \tparam 	IFMDim 		Size of the input feature map
- * \tparam 	NumChannels 	Amount of channels of the input feature map
- * \tparam 	In_t		 	Input datatype
+ *	For a sequential stepping through the output indices [0, O-1), the
+ *	corresponding sequence of input indices can be tracked along just by
+ *	maintaining an approximation error. Initially, e_0 = 0. An iterative step
+ *	taking o to o+1 produces the tentative error ê_{j+1} = e_j + Y/X assuming
+ *	no increment of the input index. If this tentative error remains below
+ *	a half, it is carried over to the next step and the input index is
+ *	not changed. Otherwise, the input index is incremented and the error is
+ *	discounted accordingly. This yields an iteration step as:
  *
- * \param 	in 				Input stream
- * \param 	out 			Output stream
- */
-template<unsigned int OFMDim,
-	unsigned int IFMDim,
-	unsigned int NumChannels,
-	typename In_t>
-void UpsampleNearestNeighbour(
-        hls::stream<ap_uint<NumChannels * In_t::width>> & in,
-        hls::stream<ap_uint<NumChannels * In_t::width>> & out
-) {
-  static_assert(OFMDim > IFMDim, "");
-
-  constexpr unsigned int scale_factor = OFMDim/IFMDim;
-  constexpr unsigned int Padding = OFMDim % IFMDim;
-  // Padding might be asymmetrical
-  constexpr unsigned int PaddingDown = Padding/2;
-  constexpr unsigned int PaddingUp = Padding - PaddingDown;
-  // Padding might be asymmetrical
-  constexpr unsigned int PaddingRight = Padding/2;
-  constexpr unsigned int PaddingLeft = Padding - PaddingRight;
-
-  ap_uint<NumChannels * In_t::width> outData, inData;
-  ap_uint<NumChannels * In_t::width> RowBuf[IFMDim];
-  int count_row = -PaddingUp; // Counter used to understand whether reading (and buffering) a row or not - Made in order to avoid modulo operations
-  for (unsigned int y = 0; y < OFMDim; y++) {
-	  for (unsigned int x = 0; x < OFMDim; x++) {
-#pragma HLS pipeline style=flp II=1
-		bool read_row = (y ==0) || count_row==scale_factor;
-		if ((x < IFMDim) && read_row)
-		{
-			inData = in.read();
-			RowBuf[x] = inData;
-		}
-		// Padding Cols
-		if(x < PaddingLeft){
-			outData = RowBuf[0];
-		}
-		else if (x >= (OFMDim - PaddingRight)){
-			outData = RowBuf[IFMDim-1];
-
-		}
-		// Padding Rows
-		else if(y < PaddingUp || y >= (OFMDim - PaddingDown)){
-			outData = RowBuf[(x-PaddingLeft)/scale_factor];
-		}
-		// No Padding
-		else{
-
-			outData = RowBuf[(x-PaddingLeft)/scale_factor];
-		}
-		//std::cout << outData << " " ;
-		out.write(outData);
-	  }// end for y
-	  //std::cout << std::endl;
-	  count_row++;
-	  if (count_row > scale_factor)
-		  count_row =1;
-  } // end for x
-
-}
-
-
-/**
- * \brief Upsampling with the Nearest Neighbour algorithm. Works with square feature maps on multiple images
+ *		ê_{j+1} = e_j + Y/X
+ *		e_{j+1} = ê_{j+1} - (ê_{j+1} < 0.5? 0 : 1)
+ *		i_{j+1} = i_j     + (ê_{j+1} < 0.5? 0 : 1)
  *
- * \tparam 	OFMDim 		Size of the output feature map
- * \tparam 	IFMDim 		Size of the input feature map
- * \tparam 	NumChannels 	Amount of channels of the input feature map
- * \tparam 	In_t		 	Input datatype
+ *	The fractional representation of the error can be made integer by using:
  *
- * \param 	in 			Input stream
- * \param 	out 			Output stream
- * \param     numReps      Number of time the function has to be repeatedly executed (e.g. number of images)
- */
-template<unsigned int OFMDim,
-	unsigned int IFMDim,
-	unsigned int NumChannels,
-	typename In_t>
-void UpsampleNearestNeighbour_Batch(
-        hls::stream<ap_uint<NumChannels * In_t::width>> & in,
-        hls::stream<ap_uint<NumChannels * In_t::width>> & out,
-		unsigned int numReps) {
-  for (unsigned int rep = 0; rep < numReps; rep++) {
-	UpsampleNearestNeighbour<OFMDim, IFMDim, NumChannels, In_t>(in, out);
-  }
-}
-
-/**
- * \brief Upsampling a vector with the Nearest Neighbour algorithm.
+ *		E_j = 2X*e_j + 2Y - X
  *
- * \tparam	OFMDim		Output vector length - must be a whole multiple of IFMDim
- * \tparam	IFMDim		Input vector length
- * \tparam	NumChannels Channels per element
- * \tparam	In_t		Per-channel input type
+ *	yielding:
  *
- * \param	src	Input stream
- * \param	dst	Output stream
+ *		E_0     = 2Y - X
+ *		Ê_{j+1} = E_j     + 2Y
+ *		E_{j+1} = Ê_{j+1} - (Ê_{j+1} < 2Y? 0 : 2X)
+ *		i_{j+1} = i_j     + (Ê_{j+1} < 2Y? 0 :  1)
+ *
+ *	The detour through the tentative error can be removed from the computation:
+ *
+ *		E_0     = 2Y - X
+ *		E_{j+1} = E_j + 2Y - (E_j < 0? 0 : 2X)
+ *		i_{j+1} = i_j      + (E_j < 0? 0 :  1)
+ *
+ *	As all E_j are sums of Y and X and only their signedness is relevant for
+ *	algorithmic decisions, Y and X can initially be reduced by their greatest
+ *	common divisor. Finally, observing that the only possible odd contribution
+ *	to E_j comes through the initialization of E_0, it can be truncated away:
+ *
+ *		E_0     = floor(Y - X/2)
+ *		E_{j+1} = E_j + Y - (E_j < 0? 0 : X)
+ *		i_{j+1} = i_j     + (E_j < 0? 0 : 1)
  */
 template<
-	unsigned  OFMDim,		// Output vector length - must be a whole multiple of IFMDim
-	unsigned  IFMDim,		// Input vector length
-	unsigned  NumChannels,	// Channels per element
-	typename  In_t			// Per-channel input type
+	unsigned  HI,	// Height of input feature map
+	unsigned  WI,	// Width of input feature map
+	unsigned  HO,	// Height of output feature map
+	unsigned  WO,	// Width of output feature map
+	unsigned  CF,	// Channel Fold
+	typename  T
 >
-void UpsampleNearestNeighbour_1D(
-        hls::stream<ap_uint<NumChannels * In_t::width>> &src,
-        hls::stream<ap_uint<NumChannels * In_t::width>> &dst
+void upsample_nn(
+	hls::stream<T> &src,
+	hls::stream<T> &dst
 ) {
-	static_assert(OFMDim % IFMDim == 0, "OFMDim must be a whole multiple of IFMDim.");
-	constexpr unsigned  REPS = OFMDim / IFMDim;
-
-	using  buf_t = ap_uint<NumChannels * In_t::width>;
-	buf_t     buf;
-	unsigned  rep = 0;
-	for(unsigned  i = 0; i < OFMDim; i++) {
 #pragma HLS pipeline II=1 style=flp
-		if(rep == 0)  buf = src.read();
-		dst.write(buf);
-		if(++rep == REPS)  rep = 0;
+	static_assert(HI <= HO, "Output height cannot be smaller than input dimension.");
+	static_assert(WI <= WO, "Output width cannot be smaller than input dimension.");
+	static_assert(0 < HI, "Input height must be positive.");
+	static_assert(0 < WI, "Input width must be positive.");
+
+	//- Output Tensor Navigation --------------------------------------------
+	// Counting to -1 for detecting the end of dimension
+	static ModCounter<HO>  ho_cnt;
+	static ModCounter<WO>  wo_cnt;
+	static ModCounter<CF>  cf_cnt;
+#pragma HLS reset variable=ho_cnt
+#pragma HLS reset variable=wo_cnt
+#pragma HLS reset variable=cf_cnt
+
+	//- Error Tracking along each Dimension ---------------------------------
+
+	// Translate dimensions into endpoint distances and remove common factors
+	constexpr unsigned  HX_ = HO-1;
+	constexpr unsigned  HY_ = HI-1;
+	constexpr unsigned  HD_ = gcd(HX_, HY_);
+	constexpr unsigned  HX = HX_/HD_;
+	constexpr unsigned  HY = HY_/HD_;
+
+	constexpr unsigned  WX_ = WO-1;
+	constexpr unsigned  WY_ = WI-1;
+	constexpr unsigned  WD_ = gcd(WX_, WY_);
+	constexpr unsigned  WX = WX_/WD_;
+	constexpr unsigned  WY = WY_/WD_;
+
+	// Error Initialization Values
+	constexpr int  HE0 = HY - (HX+1)/2;
+	constexpr int  WE0 = WY - (WX+1)/2;
+	static ap_int<1+clog2(std::max(HX-HY, HY))>  he = HE0;	// range: Y-X <= e < Y
+	static ap_int<1+clog2(std::max(WX-WY, WY))>  we = WE0;
+#pragma HLS reset variable=he
+#pragma HLS reset variable=we
+
+	//- Ring Buffer for Upsampling Replay -----------------------------------
+
+	// Write Pointer update delay needed to accommodate memory read-out latency.
+	constexpr unsigned  WP_DELAY = 4;
+	constexpr unsigned  ADDR_BITS = clog2(WI*CF);	// max retraction: full row
+	using  ptr_t = ap_int<1 + ADDR_BITS>;
+	static T  buf[1<<ADDR_BITS];
+	static ptr_t  wp[WP_DELAY] = { 0, };	// write pointer: delay for rp comparison
+	static ptr_t  rp = 0;	// read pointer: bounded by wp
+	static ptr_t  fp = 0;	// free pointer: bounds wp for next buffer generation
+#pragma HLS reset variable=buf off
+#pragma HLS reset variable=rp
+#pragma HLS reset variable=fp
+#pragma HLS reset variable=wp
+#pragma HLS dependence variable=buf inter false
+#pragma HLS dependence variable=buf intra false
+#pragma HLS array_partition variable=wp complete
+
+	//- Output Buffer Register ----------------------------------------------
+	static bool  ovld = false;
+	static T     obuf;
+#pragma HLS reset variable=ovld
+#pragma HLS reset variable=obuf off
+
+	// Update delay pipeline for wp
+	for(unsigned  i = WP_DELAY-1; i > 0; i--)  wp[i] = wp[i-1];
+
+	// Read into buffer memory if capacity is available
+	if(/* wp <= fp' */ ptr_t(wp[0]-fp) >= 0) {
+		T  x;
+		if(src.read_nb(x)){
+			buf[ap_uint<ADDR_BITS>(wp[0]++)] = x;
+			// std::cout << "read: " << x << std::endl;
+		}
 	}
-}
+
+	// Try to clear output buffer
+	if(ovld)  ovld = !dst.write_nb(obuf);
+
+	// Try to refill output buffer
+	if(!ovld) {
+		obuf = buf[ap_uint<ADDR_BITS>(rp)];
+
+		if(/* rp < wp */ ptr_t(rp-wp[WP_DELAY-1]) < 0) {
+			// Determine dimensions that will be replayed upon their next output increment
+			bool const  repw = we < 0;
+			bool const  reph = he < 0;
+
+			int  rp_inc = 1;
+			if(cf_cnt.tick()) {
+				// Wrapping from the end to the start of a dimension does simply not touch
+				// the corresponding error. Both these points are zero-error anchors.
+				if(!wo_cnt.tick()) {
+					we += repw? WY : WY-WX;
+					if(repw)  rp_inc = 1-CF;	// Replay pixel
+				}
+				else if(!ho_cnt.tick()) {
+					he += reph? HY : HY-HX;
+					if(reph)  rp_inc = 1-WI*CF;	// Replay row
+				}
+			}
+			rp += rp_inc;
+			if(!reph && !repw)  fp = rp;	// Let free pointer follow up without replay
+
+			ovld = true;
+		}
+	}
+
+} // upsample_nn()
 
 #endif
