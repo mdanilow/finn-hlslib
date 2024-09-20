@@ -5,7 +5,7 @@
 #include <hls_stream.h>
 #include <functional>
 
-#include "util.hpp"
+#include "utils.hpp"
 
 
 /**
@@ -87,15 +87,6 @@ void upsample_nn(
 	static_assert(0 < HI, "Input height must be positive.");
 	static_assert(0 < WI, "Input width must be positive.");
 
-	//- Output Tensor Navigation --------------------------------------------
-	// Counting to -1 for detecting the end of dimension
-	static ModCounter<HO>  ho_cnt;
-	static ModCounter<WO>  wo_cnt;
-	static ModCounter<CF>  cf_cnt;
-#pragma HLS reset variable=ho_cnt
-#pragma HLS reset variable=wo_cnt
-#pragma HLS reset variable=cf_cnt
-
 	//- Error Tracking along each Dimension ---------------------------------
 
 	// Translate dimensions into endpoint distances and remove common factors
@@ -114,77 +105,33 @@ void upsample_nn(
 	// Error Initialization Values
 	constexpr int  HE0 = HY - (HX+1)/2;
 	constexpr int  WE0 = WY - (WX+1)/2;
-	static ap_int<1+clog2(std::max(HX-HY, HY))>  he = HE0;	// range: Y-X <= e < Y
-	static ap_int<1+clog2(std::max(WX-WY, WY))>  we = WE0;
-#pragma HLS reset variable=he
-#pragma HLS reset variable=we
 
 	//- Ring Buffer for Upsampling Replay -----------------------------------
+	ap_int<1+clog2(std::max(HX-HY, HY))>  he = HE0;	// range: Y-X <= e < Y
+	T buf[WI*CF];
+	bool  fill = true;
+	for(unsigned ho = 0; ho < HO; ho++){
 
-	// Write Pointer update delay needed to accommodate memory read-out latency.
-	constexpr unsigned  WP_DELAY = 4;
-	constexpr unsigned  ADDR_BITS = clog2(WI*CF);	// max retraction: full row
-	using  ptr_t = ap_int<1 + ADDR_BITS>;
-	static T  buf[1<<ADDR_BITS];
-	static ptr_t  wp[WP_DELAY] = { 0, };	// write pointer: delay for rp comparison
-	static ptr_t  rp = 0;	// read pointer: bounded by wp
-	static ptr_t  fp = 0;	// free pointer: bounds wp for next buffer generation
-#pragma HLS reset variable=buf off
-#pragma HLS reset variable=rp
-#pragma HLS reset variable=fp
-#pragma HLS reset variable=wp
-#pragma HLS dependence variable=buf inter false
-#pragma HLS dependence variable=buf intra false
-#pragma HLS array_partition variable=wp complete
-
-	//- Output Buffer Register ----------------------------------------------
-	static bool  ovld = false;
-	static T     obuf;
-#pragma HLS reset variable=ovld
-#pragma HLS reset variable=obuf off
-
-	// Update delay pipeline for wp
-	for(unsigned  i = WP_DELAY-1; i > 0; i--)  wp[i] = wp[i-1];
-
-	// Read into buffer memory if capacity is available
-	if(/* wp <= fp' */ ptr_t(wp[0]-fp) >= 0) {
-		T  x;
-		if(src.read_nb(x)){
-			buf[ap_uint<ADDR_BITS>(wp[0]++)] = x;
-			// std::cout << "read: " << x << std::endl;
-		}
-	}
-
-	// Try to clear output buffer
-	if(ovld)  ovld = !dst.write_nb(obuf);
-
-	// Try to refill output buffer
-	if(!ovld) {
-		obuf = buf[ap_uint<ADDR_BITS>(rp)];
-
-		if(/* rp < wp */ ptr_t(rp-wp[WP_DELAY-1]) < 0) {
-			// Determine dimensions that will be replayed upon their next output increment
-			bool const  repw = we < 0;
-			bool const  reph = he < 0;
-
-			int  rp_inc = 1;
-			if(cf_cnt.tick()) {
-				// Wrapping from the end to the start of a dimension does simply not touch
-				// the corresponding error. Both these points are zero-error anchors.
-				if(!wo_cnt.tick()) {
-					we += repw? WY : WY-WX;
-					if(repw)  rp_inc = 1-CF;	// Replay pixel
-				}
-				else if(!ho_cnt.tick()) {
-					he += reph? HY : HY-HX;
-					if(reph)  rp_inc = 1-WI*CF;	// Replay row
-				}
+		if(fill) {
+			for(unsigned  wp = 0; wp < WI*CF; wp++) {
+				buf[wp] = src.read();
 			}
-			rp += rp_inc;
-			if(!reph && !repw)  fp = rp;	// Let free pointer follow up without replay
-
-			ovld = true;
 		}
+
+		unsigned  rp = 0;
+		ap_int<1+clog2(std::max(WX-WY, WY))>  we = WE0;
+		for(unsigned wo = 0; wo < WO; wo++){
+			for(unsigned cf = 0; cf < CF; cf++){
+				dst.write(buf[rp++]);
+			}
+			bool const repw = we < 0;
+			we += repw? WY : WY-WX;
+			if(repw) rp -= CF;
+		}
+
+		bool const reph = he < 0;
+		he += reph? HY : HY-HX;
+		fill = !reph;
 	}
 
 } // upsample_nn()
