@@ -57,10 +57,17 @@
 #include <hls_vector.h>
 #include <hls_stream.h>
 
-//- Static Evaluation of ceil(log2(x)) ---------------------------------------
+//- Compile-Time Functions --------------------------------------------------
+
 template<typename T>
 constexpr unsigned clog2(T  x) {
   return  x<2? 0 : 1+clog2((x+1)/2);
+}
+
+template<typename T>
+constexpr unsigned gcd(T  a, T  b) {
+	T const  r = a%b;
+	return  (r == 0)? b : gcd(b, r);
 }
 
 //- Helpers to get hold of types ---------------------------------------------
