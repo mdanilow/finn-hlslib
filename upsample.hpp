@@ -81,7 +81,6 @@ void upsample_nn(
 	hls::stream<T> &src,
 	hls::stream<T> &dst
 ) {
-#pragma HLS pipeline II=1 style=flp
 	static_assert(HI <= HO, "Output height cannot be smaller than input dimension.");
 	static_assert(WI <= WO, "Output width cannot be smaller than input dimension.");
 	static_assert(0 < HI, "Input height must be positive.");
